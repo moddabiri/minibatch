@@ -110,7 +110,6 @@ class MiniBatchSet(Iterator):
         return result
 
     def _get_batch(self, index):
-        lines = []
 
         start = index * self._batch_size
         if start > len(self._indices):
@@ -118,6 +117,7 @@ class MiniBatchSet(Iterator):
 
         end = start + self._batch_size
         indices = self._indices[start: min(end, self._total_lines)]
+        lines = {indx: None for indx in indices}
         indices.sort()
         file_gen = (file for file in self._files)
 
@@ -126,17 +126,17 @@ class MiniBatchSet(Iterator):
             if file is None:
                 raise OverflowError("Indices in the MiniBatchSet do not match the file set.")
 
-            index = indices.pop(0)
+            indx = indices.pop(0)
             range = file.index_range
 
-            if index < range[0]:
+            if indx < range[0]:
                 raise ValueError("Index to fetch from file was less than file index range.")
 
-            while index > range[1]:
+            while indx > range[1]:
                 file = next(file_gen, None)
                 range = file.index_range
 
-            lines.append(self._get_row(index + 1 - range[0], file.file_path))
+            lines[indx] = self._get_row(indx + 1 - range[0], file.file_path)
 
         file_gen.close()
         return lines
@@ -162,3 +162,4 @@ class MiniBatchSet(Iterator):
             self._next_counter = 0
             raise StopIteration
         return batch
+
