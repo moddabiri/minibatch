@@ -86,6 +86,9 @@ class MiniBatchSet(Iterator):
     def get_files(self):
         return self._files
 
+    def get_total_lines(self):
+        return self._total_lines
+
     def shuffle(self):
         self._next_counter = 0
         shuffle_list(self._indices)
@@ -116,8 +119,9 @@ class MiniBatchSet(Iterator):
             return None
 
         end = start + self._batch_size
-        indices = self._indices[start: min(end, self._total_lines)]
-        lines = {indx: None for indx in indices}
+        sequence = self._indices[start: min(end, self._total_lines)]
+        lines = {indx: None for indx in sequence}
+        indices = sequence
         indices.sort()
         file_gen = (file for file in self._files)
 
@@ -139,7 +143,7 @@ class MiniBatchSet(Iterator):
             lines[indx] = self._get_row(indx + 1 - range[0], file.file_path)
 
         file_gen.close()
-        return lines
+        return [lines[indx] for indx in sequence]
 
     def __eq__(self, other):
         other_files = other.get_files()
@@ -162,4 +166,3 @@ class MiniBatchSet(Iterator):
             self._next_counter = 0
             raise StopIteration
         return batch
-
