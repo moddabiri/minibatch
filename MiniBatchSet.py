@@ -21,6 +21,18 @@ class MiniBatchSet(Iterator):
             surrounding: In case values in csv are surrounded by a special character
             max_line_cache_size: Clears the line cache when the cache reaches the max size (TODO:This needs to be replaced with an implementation to dump the old entries when the cache reaches the max)
             random_distribution:If set to true, it will use randomization to pick the indices, otherwise it will keep a list of indices and shuffles it in each reset (This method ensures true unified distribution, however could take up large amount of memory relative to the ).
+
+        usage:
+            mb = MiniBatchSet(path)
+
+            mb[12]
+
+            len(mb)
+
+            next(mb)
+
+            for mini_batch in mb:
+                mb[0:2,1:5]
     """
 
     def __init__(self, file_paths_or_folder, batch_size, encoding='utf8', delimiter=",", next_line="\n", surrounding="\"", max_line_cache_size = 0, random_distribution=True):
@@ -87,6 +99,7 @@ class MiniBatchSet(Iterator):
             file_col_no = 0
         else:
             row = linecache.getline(file_path, 1)
+            linecache.clearcache()
             file_col_no = len(self._array_from_csv_row(row))
 
         return (file_row_no, file_col_no)
