@@ -121,7 +121,7 @@ class MiniBatchSet(Iterator):
     def _array_from_csv_row(self, row):
         return row.replace(self._next_line, "").replace(self._surrounding, "").split(self._delimiter)
 
-    def _get_batch(self, index):
+    def _get_batch(self, index=None):
 
         if not self._random_distribution:
             start = index * self._batch_size
