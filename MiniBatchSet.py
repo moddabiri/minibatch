@@ -2,6 +2,7 @@
 import csv
 import linecache
 import os
+import json
 from collections import Iterator
 from random import shuffle as shuffle_list
 from math import ceil
@@ -35,20 +36,8 @@ class MiniBatchSet(Iterator):
                 mb[0:2,1:5]
     """
 
-    def __init__(self, file_paths_or_folder, batch_size, encoding='utf8', delimiter=",", next_line="\n", surrounding="\"", max_line_cache_size = 0, random_distribution=True):
+    def __init__(self, batch_size=None, file_paths_or_folder=None, encoding='utf8', delimiter=",", next_line="\n", surrounding="\"", max_line_cache_size = 0, random_distribution=True):
         super().__init__()
-        if  file_paths_or_folder is None or\
-            (isinstance(file_paths_or_folder, str) and not os.path.isdir(file_paths_or_folder)) or\
-            (not isinstance(file_paths_or_folder, list) and not isinstance(file_paths_or_folder, str)):
-            raise FileNotFoundError("Parameter file_paths_or_folder must be a folder path or a collection of file paths.")
-
-        if isinstance(file_paths_or_folder, str) and \
-            os.path.isdir(file_paths_or_folder):
-            file_paths = [  os.path.join(file_paths_or_folder, f) \
-                            for f in os.listdir(file_paths_or_folder) \
-                            if os.path.isfile(os.path.join(file_paths_or_folder, f))]
-        else:
-            file_paths = file_paths_or_folder
 
         self._encoding = encoding
         self._delimiter = delimiter
@@ -58,23 +47,8 @@ class MiniBatchSet(Iterator):
         self._max_line_cache_size = max_line_cache_size
         self._random_distribution = random_distribution
 
-        for file_path in file_paths:
-            if not os.path.exists(file_path):
-                raise FileNotFoundError("The requested file not found on the given path.")
-            
-            shape = self._get_shape(file_path, self._delimiter, self._encoding)
-            self._files.append( type('obj', (object,), {\
-                                            'file_path' : file_path,\
-                                            'shape': shape,\
-                                            'index_range': (self._total_lines, self._total_lines + shape[0] - 1)\
-                                        }))
-            
-            self._total_lines += shape[0]
-
-        if (not random_distribution):
-            self._indices = list(range(self._total_lines))
-        elif not np:
-            raise NotImplementedError("Numpy was not detected. Random distribution requires numpy.random package.")
+        if not file_paths_or_folder is None:
+            self._load(file_paths_or_folder)
 
     _files = []
     _indices = []
@@ -88,6 +62,38 @@ class MiniBatchSet(Iterator):
     _max_line_cache_size = 0
     _line_cache_counter = 0
     _random_distribution = True
+
+    def _load(self, file_paths_or_folder):
+        if  (isinstance(file_paths_or_folder, str) and not os.path.isdir(file_paths_or_folder)) or\
+                (not isinstance(file_paths_or_folder, list) and not isinstance(file_paths_or_folder, str)):
+                raise FileNotFoundError("Parameter file_paths_or_folder must be a folder path or a collection of file paths.")
+
+        if isinstance(file_paths_or_folder, str) and \
+            os.path.isdir(file_paths_or_folder):
+            file_paths = [  os.path.join(file_paths_or_folder, f) \
+                            for f in os.listdir(file_paths_or_folder) \
+                            if os.path.isfile(os.path.join(file_paths_or_folder, f))]
+        else:
+            file_paths = file_paths_or_folder
+
+        for file_path in file_paths:
+            if not os.path.exists(file_path):
+                raise FileNotFoundError("The requested file not found on the given path.")
+            
+            shape = self._get_shape(file_path, self._delimiter, self._encoding)
+            self._files.append( {\
+                                'file_path' : file_path,\
+                                'shape': shape,\
+                                'index_range': (self._total_lines, self._total_lines + shape[0] - 1)\
+                                })
+            
+            self._total_lines += shape[0]
+            print("File %s added to source list."%os.path.basename(file_path))
+
+        if (not self._random_distribution):
+            self._indices = list(range(self._total_lines))
+        elif not np:
+            raise NotImplementedError("Numpy was not detected. Random distribution requires numpy.random package.")
     
     def _get_shape(self, file_path, delimiter, encoding):
         file_row_no = 0
@@ -144,16 +150,16 @@ class MiniBatchSet(Iterator):
                 raise OverflowError("Indices in the MiniBatchSet do not match the file set.")
 
             indx = indices.pop(0)
-            range = file.index_range
+            range = file["index_range"]
 
             if indx < range[0]:
                 raise ValueError("Index to fetch from file was less than file index range.")
 
             while indx > range[1]:
                 file = next(file_gen, None)
-                range = file.index_range
+                range = file["index_range"]
 
-            lines[indx] = self._get_row(indx + 1 - range[0], file.file_path)
+            lines[indx] = self._get_row(indx + 1 - range[0], file["file_path"])
 
         file_gen.close()
         return [lines[indx] for indx in sequence]
@@ -169,6 +175,78 @@ class MiniBatchSet(Iterator):
         if not self._random_distribution:
             shuffle_list(self._indices)
 
+    def transform_data(self, action, output_path=None):
+        if not output_path is None and not os.path.exists(output_path):
+                os.makedirs(output_path)
+
+        for file in self._files:
+            file_path = file["file_path"]
+            file_name = os.path.basename(file_path)
+            print("File %s starting."%file_name)
+
+            with open(file_path, 'r', encoding=self._encoding) as f_read:
+                reader = csv.reader(f_read, delimiter=self._delimiter)
+                f_write = None
+                try:
+                    if not output_path is None:
+                        write_path = os.path.join(output_path, file_name)
+                        f_write = open(write_path, 'w', encoding=self._encoding)
+                        writer = csv.writer(f_write, quoting=csv.QUOTE_ALL)
+
+                    for index, row in enumerate(reader):                        
+                        if not output_path is None:
+                            data = action(row)
+                            writer.writerow(data)
+                        else:
+                            action(row)
+                except Exception as ex:
+                    raise Exception("Failed to process {0} due to: {1}.".format(file_name, ex))
+                finally:
+                    if f_write:
+                        f_write.close()
+
+            print("File %s processed."%file_name)
+
+    def save_snapshot(self, snapshot_path, force_overwrite=True):
+        if os.path.exists(snapshot_path):
+            if force_overwrite:
+                print("Snapshot exist on the given path, deleting the old snapshot.")
+                os.remove(snapshot_path)
+            else:
+                raise FileExistsError("The snapshot file existed on the given path. To force overwrite the file set the parameter force_overwrite to True.")
+
+        with open(snapshot_path, 'w') as f:
+            content = { "files":self._files, \
+                        "indices":self._indices,\
+                        "total_lines":self._total_lines,\
+                        "random_distribution":self._random_distribution,\
+                        "max_line_cache_size":self._max_line_cache_size,\
+                        "batch_size":self._batch_size,\
+                        "next_counter":self._next_counter,\
+                        "encoding":self._encoding,\
+                        "delimiter":self._delimiter,\
+                        "next_line":self._next_line\
+                        }
+            json.dump(content, f)
+
+    @staticmethod
+    def from_snapshot(snapshot_path):
+        content = None
+        with open(snapshot_path, 'r') as f:
+            content = json.load(f)
+
+        bs = MiniBatchSet()
+        bs._files = content["files"]
+        bs._indices = content["indices"]
+        bs._total_lines = content["total_lines"]
+        bs._random_distribution = content["random_distribution"]
+        bs._max_line_cache_size = content["max_line_cache_size"]
+        bs._batch_size = content["batch_size"]
+        bs._next_counter = content["next_counter"]
+        bs._encoding = content["encoding"]
+        bs._delimiter = content["delimiter"]
+        bs._next_line = content["next_line"]
+        return bs
 
     def __len__(self):
         return ceil(self._total_lines / self._batch_size)
