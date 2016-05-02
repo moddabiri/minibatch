@@ -6,6 +6,7 @@ import json
 from collections import Iterator
 from random import shuffle as shuffle_list
 from math import ceil
+from multiprocessing.pool import ThreadPool
 
 if not importlib.find_loader('numpy') is None:
     import numpy as np
@@ -21,7 +22,8 @@ class MiniBatchSet(Iterator):
             next_line: Line separator character in the csv format
             surrounding: In case values in csv are surrounded by a special character
             max_line_cache_size: Clears the line cache when the cache reaches the max size (TODO:This needs to be replaced with an implementation to dump the old entries when the cache reaches the max)
-            random_distribution:If set to true, it will use randomization to pick the indices, otherwise it will keep a list of indices and shuffles it in each reset (This method ensures true unified distribution, however could take up large amount of memory relative to the ).
+            random_distribution: If set to true, it will use randomization to pick the indices, otherwise it will keep a list of indices and shuffles it in each reset (This method ensures true unified distribution, however could take up large amount of memory relative to the ).
+            pool_async: If set to true, will pool the next instance of batch in memory on each fetch.
 
         usage:
             mb = MiniBatchSet(path)
@@ -36,7 +38,7 @@ class MiniBatchSet(Iterator):
                 mb[0:2,1:5]
     """
 
-    def __init__(self, batch_size=None, file_paths_or_folder=None, encoding='utf8', delimiter=",", next_line="\n", surrounding="\"", max_line_cache_size = 0, random_distribution=True):
+    def __init__(self, batch_size=None, file_paths_or_folder=None, encoding='utf8', delimiter=",", next_line="\n", surrounding="\"", max_line_cache_size = 0, random_distribution=True, pool_async=True):
         super().__init__()
 
         self._encoding = encoding
@@ -46,6 +48,8 @@ class MiniBatchSet(Iterator):
         self._surrounding = surrounding
         self._max_line_cache_size = max_line_cache_size
         self._random_distribution = random_distribution
+        self._pool_async = pool_async
+        self._thread_pool = ThreadPool(processes=1)
 
         if not file_paths_or_folder is None:
             self._load(file_paths_or_folder)
@@ -62,6 +66,10 @@ class MiniBatchSet(Iterator):
     _max_line_cache_size = 0
     _line_cache_counter = 0
     _random_distribution = True
+    _pool_async = True
+
+    _thread_pool = None
+    _fetch_thread = None
 
     def _load(self, file_paths_or_folder):
         if  (isinstance(file_paths_or_folder, str) and not os.path.isdir(file_paths_or_folder)) or\
@@ -128,7 +136,7 @@ class MiniBatchSet(Iterator):
         return row.replace(self._next_line, "").replace(self._surrounding, "").split(self._delimiter)
 
     def _get_batch(self, index=None):
-
+        print("get_batch")
         if not self._random_distribution:
             start = index * self._batch_size
             if start > self._total_lines:
@@ -164,6 +172,20 @@ class MiniBatchSet(Iterator):
         file_gen.close()
         return [lines[indx] for indx in sequence]
     
+    def _retrieve_batch(self, index=None):
+        print("Retrieve")
+        if not self._pool_async:
+            return self._get_batch(index)
+
+        if self._fetch_thread is None:
+            self._fetch_thread = self._thread_pool.apply_async(self._get_batch)
+            return self._get_batch(index)
+        else:
+            minibatch = self._fetch_thread.get()
+            self._fetch_thread = self._thread_pool.apply_async(self._get_batch)
+            return minibatch
+        
+
     def get_files(self):
         return self._files
 
@@ -210,7 +232,6 @@ class MiniBatchSet(Iterator):
     def save_snapshot(self, snapshot_path, force_overwrite=True):
         if os.path.exists(snapshot_path):
             if force_overwrite:
-                print("Snapshot exist on the given path, deleting the old snapshot.")
                 os.remove(snapshot_path)
             else:
                 raise FileExistsError("The snapshot file existed on the given path. To force overwrite the file set the parameter force_overwrite to True.")
@@ -225,9 +246,13 @@ class MiniBatchSet(Iterator):
                         "next_counter":self._next_counter,\
                         "encoding":self._encoding,\
                         "delimiter":self._delimiter,\
-                        "next_line":self._next_line\
+                        "next_line":self._next_line,\
+                        "pool_async":self._pool_async\
                         }
             json.dump(content, f)
+
+    def is_random(self):
+        return self._random_distribution
 
     @staticmethod
     def from_snapshot(snapshot_path):
@@ -246,6 +271,7 @@ class MiniBatchSet(Iterator):
         bs._encoding = content["encoding"]
         bs._delimiter = content["delimiter"]
         bs._next_line = content["next_line"]
+        bs._pool_async = content["pool_async"] 
         return bs
 
     def __len__(self):
@@ -258,11 +284,11 @@ class MiniBatchSet(Iterator):
             raise ValueError("The indices must either be a single index or a slice.")
 
         if isinstance(the_slices, int):
-            return self._get_batch(the_slices)
+            return self._retrieve_batch(the_slices)
 
         result = []
         for batch_index in range(the_slices.start, the_slices.stop):
-            result.append(self._get_batch(batch_index))
+            result.append(self._retrieve_batch(batch_index))
 
         return result
 
@@ -281,12 +307,24 @@ class MiniBatchSet(Iterator):
 
     def __next__(self):
         if self._random_distribution:
-            batch = self._get_batch()
+            batch = self._retrieve_batch()
         else:
-            batch = self._get_batch(self._next_counter)
+            batch = self._retrieve_batch(self._next_counter)
             self._next_counter += 1
         
         if not batch:
             self._next_counter = 0
             raise StopIteration
         return batch
+
+if __name__ == "__main__":
+    basepath = "D:/Projects/VS2015/MachineLearning'/PFTD.ML.GradientDescent.Test/Sample_Data/minibatching_data_small/"
+    bs = MiniBatchSet(file_paths_or_folder=basepath, batch_size=5)
+    bs.save_snapshot("D:/test_dump.json")
+
+    bs = MiniBatchSet.from_snapshot("D:/test_dump.json")
+    for i in range(10):
+        print("Getting")
+        batch = next(bs)
+        print("Acquired")
+        #print(batch)
