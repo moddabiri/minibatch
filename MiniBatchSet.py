@@ -4,17 +4,26 @@ import linecache
 import os
 import json
 import sys
+import multiprocessing as mp
+from multiprocessing.pool import ThreadPool
 from collections import Iterator
 from random import shuffle as shuffle_list
 from math import ceil
-from multiprocessing.pool import ThreadPool
 from threading import current_thread
 from datetime import datetime
+from math import ceil
+import ml_util.math_helpers as mh
+from queue import Queue
 
 if not importlib.find_loader('numpy') is None:
     import numpy as np
 else:
     print("WARNING! Numpy was not installed on the vm. Numerical functionalities will not work.")
+
+if not importlib.find_loader('pandas') is None:
+    import pandas as pd
+else:
+    print("WARNING! Pandas was not installed on the vm. Bulking functionalities will not work.")
 
 class MiniBatchSet(Iterator):
     """ A class to generate mini-batches of data from a set of csv files. 
@@ -42,7 +51,7 @@ class MiniBatchSet(Iterator):
                 mb[0:2,1:5]
     """
 
-    def __init__(self, batch_size=None, file_paths_or_folder=None, encoding='utf8', delimiter=",", surrounding="\"", max_line_cache_size = 0, random_distribution=True, pool_async=True, hold_in_memory=False, np_dtype=np.float64):
+    def __init__(self, batch_size=None, file_paths_or_folder=None, encoding='utf8', delimiter=",", surrounding="\"", max_line_cache_size = 0, random_distribution=True, pool_async=True, hold_in_memory=False, np_dtype=np.float64, bulk_size=1):
         super().__init__()
         #TODO: Handle using, saving and restoring the dtype
         self._encoding = encoding
@@ -52,8 +61,9 @@ class MiniBatchSet(Iterator):
         self._max_line_cache_size = max_line_cache_size
         self._random_distribution = random_distribution
         self._pool_async = pool_async
-        self._thread_pool = ThreadPool(processes=1)
+        self._thread_pool = ThreadPool(processes=mp.cpu_count())
         self._hold_in_memory = hold_in_memory
+        self._bulk_size = bulk_size
 
         self._files = []
         self._data = None
@@ -81,9 +91,11 @@ class MiniBatchSet(Iterator):
     _random_distribution = True
     _pool_async = True
     _hold_in_memory = False
+    _bulk_size = None
 
     _thread_pool = None
-    _fetch_thread = None
+    _fetch_threads = None
+    _batch_buffer = None
 
     def _load(self, file_paths_or_folder):
         if not isinstance(file_paths_or_folder, list) and not isinstance(file_paths_or_folder, str):
@@ -131,7 +143,10 @@ class MiniBatchSet(Iterator):
 
         if self._hold_in_memory:
             self._load_on_memory()
-    
+                
+    def init_buffer(self):
+        self._batch_buffer = Queue(self._bulk_size)
+
     def _load_on_memory(self):
         print("Manager was set to fetch the data in the memory, loading all the data")
         self._data = {}
@@ -187,7 +202,7 @@ class MiniBatchSet(Iterator):
             if not self._data:
                 self._load_on_memory()
 
-            return self._data[file_path][row_no]
+            return self._data[file_path][row_no-1]
         else:
             row = self._get_line(row_no, file_path)
             return self._array_from_csv_row(row)
@@ -195,16 +210,29 @@ class MiniBatchSet(Iterator):
     def _array_from_csv_row(self, row):
         return row.replace("\n", "").replace(self._surrounding, "").split(self._delimiter)
 
-    def _get_batch(self, index=None):
-        if not self._random_distribution:
-            start = index * self._batch_size
-            if start > self._total_lines:
-                raise IndexError("Given batch index was out of the acceptable range. Acceptable values are 0-indexed numbers less than the number of batches.")
+    def _get_file_index_slices(self):
+        no_of_files = len(self._files)
+        slices = np.zeros((no_of_files,1))
+        counter = 0
 
-            end = start + self._batch_size
-            sequence = self._indices[start: min(end, self._total_lines)]
+        for file_data in self._files:
+            range = file_data["index_range"]
+            slices[counter] = range[1]
+            counter += 1
+
+    def _get_batch(self, index=None):
+        if self._random_distribution:
+            return self._get_batch_bulk()
         else:
-            sequence = np.random.random_integers(0, self._total_lines - 1, self._batch_size).tolist()
+            return self._get_batch_by_index(index)
+
+    def _get_batch_by_index(self, index=None):
+        start = index * self._batch_size
+        if start > self._total_lines:
+            raise IndexError("Given batch index was out of the acceptable range. Acceptable values are 0-indexed numbers less than the number of batches.")
+
+        end = start + self._batch_size
+        sequence = self._indices[start: min(end, self._total_lines)]
 
         lines = {indx: None for indx in sequence}
         indices = sequence[:]
@@ -231,29 +259,104 @@ class MiniBatchSet(Iterator):
 
         file_gen.close()
         return [lines[indx] for indx in sequence]
-    
-    def _retrieve_next(self):
-        start = self._next_counter * self._batch_size
-        if start > self._total_lines:
-            #If end of batch sequence is reached, reset 
-            self.reset()
 
-        if not self._pool_async:
-            return self._get_batch(self._next_counter)
-            self._next_counter += 1
 
-        if self._fetch_thread is None:
-            self._fetch_thread = self._thread_pool.apply_async(self._get_batch, (self._next_counter,))
-            self._next_counter += 1
-            batch = self._get_batch(self._next_counter)
-            self._next_counter += 1
-            return batch
-        else:
-            minibatch = self._fetch_thread.get()
-            self._fetch_thread = self._thread_pool.apply_async(self._get_batch, (self._next_counter,))
-            self._next_counter += 1
-            return minibatch
+    def _get_batch_bulk(self):
+        number_of_proc = mp.cpu_count()
+        print(">>>--[MINI BATCH] [STARTING TO FETCH A BULK OF SIZE %d] [USING %d VCPUs]"%(self._bulk_size, number_of_proc))
+        sequence = np.random.random_integers(0, self._total_lines - 1, self._batch_size * self._bulk_size)
+        chunk_size = self._batch_size * self._bulk_size
+        seq_chunks = np.array_split(sequence,number_of_proc)
+        threads = Queue(number_of_proc)
+        thread_pool = ThreadPool(processes=number_of_proc)
+
+        def process_chunk(proc_no, files, total_columns, sequence_chunk, delimiter):
+            chunk_size = len(seq_chunk)
+            chunk = np.matrix(np.zeros((chunk_size, total_columns)), dtype=np.float64)
+            total_added = 0
+
+            for file in files:
+                range = file["index_range"]
+                file_indices = sequence_chunk[(sequence_chunk>=range[0]) & (sequence_chunk<=range[1])]
+                file_indices_org = file_indices.tolist()
+                file_indices = np.subtract(file_indices, range[0])
+                if len(file_indices) > 0:
+                    data = pd.read_csv(file["file_path"], delimiter=delimiter, dtype=np.float64, header=None).values
+                    prev_total_added = total_added
+                    total_added += len(file_indices)
+                    chunk[prev_total_added:total_added, :] = data[file_indices,:]
+
+                    #done_percentage = (total_added / chunk_size)*100
+                    #file_name = os.path.basename(file["file_path"])
+                    #print(">>>--[MINI BATCH] [PROCESS: %d] [BUFFER REPORT] [FILE: %s] [PROGRESS %d%%]"%(proc_no, file_name, done_percentage))
+            return chunk
+
+        thread_counter = 1
+        for seq_chunk in seq_chunks:
+            thread = thread_pool.apply_async(process_chunk, (thread_counter, self._files, self._total_columns, seq_chunk,self._delimiter,))
+            threads.put(thread)
+            thread_counter += 1
+
+        full_set = np.array(np.zeros((0,self._total_columns)))
+        for seq_chunk in seq_chunks:
+            thread = threads.get()
+            data = thread.get()
+            full_set = np.concatenate((full_set,data))
         
+        #print(">>>--[MINI BATCH] [Batch bulk acquied, total shape: %s] [Breaking to bulks now...]"%str(full_set.shape))
+        np.random.shuffle(full_set)
+        result = np.split(full_set, self._bulk_size)
+
+        print(">>>--[MINI BATCH] [Batch bulk acquied, bulk set shape: %s]"%str(len(result)))
+        return result
+        
+    def _retrieve_next(self):
+        if not self._random_distribution:
+            start = self._next_counter * self._batch_size
+            if start > self._total_lines:
+                #If end of batch sequence is reached, reset 
+                self.reset()
+
+            if not self._pool_async:
+                batch = self._get_batch(self._next_counter)
+                self._next_counter += 1
+                return batch
+
+            if self._fetch_thread is None:
+                self._fetch_thread = self._thread_pool.apply_async(self._get_batch, (self._next_counter,))
+                self._next_counter += 1
+                batch = self._get_batch(self._next_counter)
+                self._next_counter += 1
+                return batch
+            else:
+                minibatch = self._fetch_thread.get()
+                self._fetch_thread = self._thread_pool.apply_async(self._get_batch, (self._next_counter,))
+                self._next_counter += 1
+                return minibatch
+        else:
+            #Take a completely different approach if random distribution is chosen
+            if self._batch_buffer is None:
+                self.init_buffer()
+                batch_bulk = self._get_batch()
+                for batch in batch_bulk:
+                    self._batch_buffer.put(batch)          
+            elif self._fetch_thread is None and self._batch_buffer.qsize() < self._batch_buffer.maxsize / 2:
+                print("%d < %d"%(self._batch_buffer.qsize() , self._batch_buffer.maxsize / 2))
+                print(">>>--[MINI BATCH] [Buffer goes lower than threashold] [Starting the buffering on a new process...]")
+                #Refill the queue if buffer runs lower than 50%
+                self._fetch_thread = self._thread_pool.apply_async(self._get_batch)
+
+            if self._batch_buffer.empty():
+                print(">>>--[MINI BATCH] [Bulk buffer is out of batches] [Getting the next bulk from the buffering process. It may block the process until buffering is done.]")
+                batch_bulk = self._fetch_thread.get()
+                self._fetch_thread = None
+                for batch in batch_bulk:
+                    self._batch_buffer.put(batch)  
+
+            batch = self._batch_buffer.get()
+
+            return batch
+            
 
     def get_files(self):
         return self._files
@@ -320,22 +423,23 @@ class MiniBatchSet(Iterator):
                         "next_counter":self._next_counter,\
                         "encoding":self._encoding,\
                         "delimiter":self._delimiter,\
-                        "pool_async":self._pool_async\
+                        "pool_async":self._pool_async,\
+                        "bulk_size":self._bulk_size,\
+                        "total_columns":self._total_columns\
                         }
             json.dump(content, f)
 
     def is_random(self):
         return self._random_distribution
 
-    def normalize(self, output_path, indices=None):
+    def get_normalization_parameters(self, indices):
         if self._total_lines <= 1:
-            print("Skipping the normalization since the set includes 1 or less lines.")
+            raise ValueError("Invalid attempt to run normalization since the whole set includes 1 or less lines.")
             return
 
         if not np:
             raise ImportError("Numpy was not detected. This operation requires numpy for calculations.")
 
-        indices = indices or [i for i in range(self._total_columns)]
         sums = np.array([0.0] * len(indices),np.float64)
         deviations = np.array([0.0] * len(indices),np.float64)
         mu = np.float64(0.0)
@@ -348,8 +452,7 @@ class MiniBatchSet(Iterator):
             #if any(val for val in sums if val == sys.float_info.max):
             #    raise OverflowError("The sum exceeds the maximum float size for sums {0} on row {1}. Try deducting the values to reduce the sum below the max float size of {2}".format(sums.tolist(), data, sys.float_info.max))
             return [sums]
-
-
+        
         def get_deviations_action(data, mu, deviations):
             data = np.array([data[i] for i in indices], dtype=np.float64)
             deviations = np.add(deviations, np.power(np.subtract(data, mu), 2))
@@ -359,10 +462,26 @@ class MiniBatchSet(Iterator):
 
             return [mu, deviations]
 
+        running1 = self.transform_data(get_sum_action, None, sums)
+        sums = running1[0]
+        mu = np.divide(sums, self._total_lines)
+
+        mu, deviations = self.transform_data(get_deviations_action, None, mu, deviations)
+        sigma = np.sqrt(np.divide(deviations, self._total_lines - 1))
+        return mu, sigma
+
+    def normalize(self, output_path, indices=None, mu=None, sigma=None):
+        indices = indices or [i for i in range(self._total_columns)]
+
+        if mu is None or sigma is None:
+            mu_new, sigma_new = self.get_normalization_parameters(indices)
+            mu = mu_new if mu is None else mu
+            sigma = sigma_new if sigma is None else sigma        
+        
         def produce_normalized_files_action(data, mu, sigma):
             p_data = np.array([data[i] for i in indices], dtype=np.float64)
-            mu = np.array([0.0 if np.float64(sigma[i]) == 0.0 else mu[i] for i in range(len(sigma))])             #Ignore single value lists
-            sigma = np.array([np.float64(1.0) if sigma[i] == np.float64(0.0) else sigma[i] for i in range(len(sigma))])        #Ignore single value lists
+            mu = np.array([0.0 if np.float64(sigma[i]) == 0.0 else mu[i] for i in range(len(sigma))], np.float64)             #Ignore single value lists
+            sigma = np.array([np.float64(1.0) if sigma[i] == np.float64(0.0) else sigma[i] for i in range(len(sigma))], np.float64)        #Ignore single value lists
 
             #print("mu:" + str(mu))
             #print("sigma:" + str(sigma))
@@ -375,16 +494,30 @@ class MiniBatchSet(Iterator):
             #print("After:" + str(data))
             return data, [mu, sigma]
 
-        running1 = self.transform_data(get_sum_action, None, sums)
-        sums = running1[0]
-        mu = np.divide(sums, self._total_lines)
-
-        mu, deviations = self.transform_data(get_deviations_action, None, mu, deviations)
-        sigma = np.sqrt(np.divide(deviations, self._total_lines - 1))
-        
-        #print("mean=" + str(mu))
-        #print("std=" + str(sigma))
         self.transform_data(produce_normalized_files_action, output_path, mu, sigma)
+
+    def even_files(self, records_per_file, output_path):
+        def distribution_action(data, records_per_file, output_path, delimiter, current_count, file_index, file, writer):
+            if file is None or current_count > records_per_file:
+                current_count = 0
+                file_index += 1
+
+                if not file is None:
+                    file.close()
+
+                file = open(os.path.join(output_path, 'data_%d.csv'%file_index), 'w', encoding=self._encoding)
+                writer = csv.writer(file, quoting=csv.QUOTE_NONE)
+                
+            writer.writerow(data)
+            current_count += 1
+
+            return [records_per_file, output_path, delimiter, current_count, file_index, file, writer]
+
+        records_per_file, output_path, delimiter, current_count, file_index, file, writer = \
+            self.transform_data(distribution_action, None, records_per_file, output_path, self._delimiter, 0, 0, None, None)
+
+        if not file is None:
+            file.close()
 
     def map_features(self, output_path, mapping):
         pass
@@ -406,6 +539,8 @@ class MiniBatchSet(Iterator):
         bs._encoding = content["encoding"]
         bs._delimiter = content["delimiter"]
         bs._pool_async = content["pool_async"] 
+        bs._bulk_size = content["bulk_size"] 
+        bs._total_columns = content["total_columns"]
         return bs
 
 
