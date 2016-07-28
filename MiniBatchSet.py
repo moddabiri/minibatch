@@ -1,4 +1,12 @@
-﻿import importlib
+﻿__author__ = "Mohammad Dabiri"
+__copyright__ = "Free to use, copy and modify"
+__credits__ = ["Mohammad Dabiri"]
+__license__ = "MIT Licence"
+__version__ = "0.0.1"
+__maintainer__ = "Mohammad Dabiri"
+__email__ = "moddabiri@yahoo.com"
+
+import importlib
 import csv
 import linecache
 import os
@@ -53,7 +61,7 @@ class MiniBatchSet(Iterator):
 
     def __init__(self, batch_size=None, file_paths_or_folder=None, encoding='utf8', delimiter=",", surrounding="\"", max_line_cache_size = 0, random_distribution=True, pool_async=True, hold_in_memory=False, np_dtype=np.float64, bulk_size=1):
         super().__init__()
-        #TODO: Handle using, saving and restoring the dtype
+
         self._encoding = encoding
         self._delimiter = delimiter
         self._batch_size = batch_size
@@ -64,6 +72,7 @@ class MiniBatchSet(Iterator):
         self._thread_pool = ThreadPool(processes=mp.cpu_count())
         self._hold_in_memory = hold_in_memory
         self._bulk_size = bulk_size
+        self._np_dtype = np.dtype(np_dtype)
 
         self._files = []
         self._data = None
@@ -96,13 +105,14 @@ class MiniBatchSet(Iterator):
     _thread_pool = None
     _fetch_threads = None
     _batch_buffer = None
+    _np_dtype=np.dtype(np.float32)
 
     def _load(self, file_paths_or_folder):
         if not isinstance(file_paths_or_folder, list) and not isinstance(file_paths_or_folder, str):
             raise TypeError("Parameter file_paths_or_folder must be a folder path or a collection of file paths.")
 
         if isinstance(file_paths_or_folder, str) and not os.path.exists(file_paths_or_folder):
-            raise FileNotFoundError("Given folder path did not exist.")
+            raise FileNotFoundError("Given folder path did not exist: " + file_paths_or_folder)
 
         if isinstance(file_paths_or_folder, str) and not os.path.isdir(file_paths_or_folder):
             raise NotADirectoryError("Given path was not a directory. Either provide a directory path or a collection of file paths.")
@@ -155,7 +165,7 @@ class MiniBatchSet(Iterator):
         try:
             for file in self._files:
                 file_path = file['file_path']
-                lines_in_file = np.loadtxt(file_path, delimiter=self._delimiter, dtype=np.float64)
+                lines_in_file = pd.read_csv(file_path, delimiter=self._delimiter, dtype=self._np_dtype, header=None).values
                 self._data[file_path] = lines_in_file
                 total_lines_read += lines_in_file.shape[0]
 
@@ -164,9 +174,6 @@ class MiniBatchSet(Iterator):
                     eta = ceil(((self._total_lines - total_lines_read) * minutes_passed)/total_lines_read)
                     print("Load completion ETA: %d minute(s)"%eta)
                     print("Read %d lines of total %d"%(total_lines_read, self._total_lines))
-
-                print("Total lines: " + str(file['shape']))
-                print("Np size: " + str(self._data[file_path].shape))
 
             print("Data fully loaded in the memory. Allocated size is %gKB."%(sys.getsizeof(self._data)/1000))
         except MemoryError as m_err:
@@ -263,16 +270,16 @@ class MiniBatchSet(Iterator):
 
     def _get_batch_bulk(self):
         number_of_proc = mp.cpu_count()
-        print(">>>--[MINI BATCH] [STARTING TO FETCH A BULK OF SIZE %d] [USING %d VCPUs]"%(self._bulk_size, number_of_proc))
+        #print(">>>--[MINI BATCH] [STARTING TO FETCH A BULK OF SIZE %d] [USING %d VCPUs]"%(self._bulk_size, number_of_proc))
         sequence = np.random.random_integers(0, self._total_lines - 1, self._batch_size * self._bulk_size)
         chunk_size = self._batch_size * self._bulk_size
         seq_chunks = np.array_split(sequence,number_of_proc)
         threads = Queue(number_of_proc)
         thread_pool = ThreadPool(processes=number_of_proc)
 
-        def process_chunk(proc_no, files, total_columns, sequence_chunk, delimiter):
+        def process_chunk(proc_no, files, total_columns, sequence_chunk, delimiter, np_dtype):
             chunk_size = len(seq_chunk)
-            chunk = np.matrix(np.zeros((chunk_size, total_columns)), dtype=np.float64)
+            chunk = np.matrix(np.zeros((chunk_size, total_columns)), dtype=np_dtype)
             total_added = 0
 
             for file in files:
@@ -281,7 +288,7 @@ class MiniBatchSet(Iterator):
                 file_indices_org = file_indices.tolist()
                 file_indices = np.subtract(file_indices, range[0])
                 if len(file_indices) > 0:
-                    data = pd.read_csv(file["file_path"], delimiter=delimiter, dtype=np.float64, header=None).values
+                    data = pd.read_csv(file["file_path"], delimiter=delimiter, dtype=np_dtype, header=None).values
                     prev_total_added = total_added
                     total_added += len(file_indices)
                     chunk[prev_total_added:total_added, :] = data[file_indices,:]
@@ -293,7 +300,7 @@ class MiniBatchSet(Iterator):
 
         thread_counter = 1
         for seq_chunk in seq_chunks:
-            thread = thread_pool.apply_async(process_chunk, (thread_counter, self._files, self._total_columns, seq_chunk,self._delimiter,))
+            thread = thread_pool.apply_async(process_chunk, (thread_counter, self._files, self._total_columns, seq_chunk,self._delimiter,self._np_dtype,))
             threads.put(thread)
             thread_counter += 1
 
@@ -307,7 +314,7 @@ class MiniBatchSet(Iterator):
         np.random.shuffle(full_set)
         result = np.split(full_set, self._bulk_size)
 
-        print(">>>--[MINI BATCH] [Batch bulk acquied, bulk set shape: %s]"%str(len(result)))
+        #print(">>>--[MINI BATCH] [Batch bulk acquied, bulk set shape: %s]"%str(len(result)))
         return result
         
     def _retrieve_next(self):
@@ -341,13 +348,13 @@ class MiniBatchSet(Iterator):
                 for batch in batch_bulk:
                     self._batch_buffer.put(batch)          
             elif self._fetch_thread is None and self._batch_buffer.qsize() < self._batch_buffer.maxsize / 2:
-                print("%d < %d"%(self._batch_buffer.qsize() , self._batch_buffer.maxsize / 2))
-                print(">>>--[MINI BATCH] [Buffer goes lower than threashold] [Starting the buffering on a new process...]")
+                #print("%d < %d"%(self._batch_buffer.qsize() , self._batch_buffer.maxsize / 2))
+                #print(">>>--[MINI BATCH] [Buffer goes lower than threashold] [Starting the buffering on a new process...]")
                 #Refill the queue if buffer runs lower than 50%
                 self._fetch_thread = self._thread_pool.apply_async(self._get_batch)
 
             if self._batch_buffer.empty():
-                print(">>>--[MINI BATCH] [Bulk buffer is out of batches] [Getting the next bulk from the buffering process. It may block the process until buffering is done.]")
+                #print(">>>--[MINI BATCH] [Bulk buffer is out of batches] [Getting the next bulk from the buffering process. It may block the process until buffering is done.]")
                 batch_bulk = self._fetch_thread.get()
                 self._fetch_thread = None
                 for batch in batch_bulk:
@@ -425,7 +432,8 @@ class MiniBatchSet(Iterator):
                         "delimiter":self._delimiter,\
                         "pool_async":self._pool_async,\
                         "bulk_size":self._bulk_size,\
-                        "total_columns":self._total_columns\
+                        "total_columns":self._total_columns,\
+                        "np_dtype":self._np_dtype.name
                         }
             json.dump(content, f)
 
@@ -440,13 +448,13 @@ class MiniBatchSet(Iterator):
         if not np:
             raise ImportError("Numpy was not detected. This operation requires numpy for calculations.")
 
-        sums = np.array([0.0] * len(indices),np.float64)
-        deviations = np.array([0.0] * len(indices),np.float64)
-        mu = np.float64(0.0)
-        sigma = np.float64(0.0)
+        sums = np.array([0.0] * len(indices),dtype=self._np_dtype)
+        deviations = np.array([0.0] * len(indices),dtype=self._np_dtype)
+        mu = self._np_dtype.type(0.0)
+        sigma = self._np_dtype.type(0.0)
 
         def get_sum_action(data, sums):
-            data = np.array([data[i] for i in indices], dtype=np.float64)
+            data = np.array([data[i] for i in indices], dtype=self._np_dtype)
             sums = np.add(sums, data)
 
             #if any(val for val in sums if val == sys.float_info.max):
@@ -454,7 +462,7 @@ class MiniBatchSet(Iterator):
             return [sums]
         
         def get_deviations_action(data, mu, deviations):
-            data = np.array([data[i] for i in indices], dtype=np.float64)
+            data = np.array([data[i] for i in indices], dtype=self._np_dtype)
             deviations = np.add(deviations, np.power(np.subtract(data, mu), 2))
 
             #if any(val for val in deviations if val == sys.float_info.max):
@@ -479,9 +487,9 @@ class MiniBatchSet(Iterator):
             sigma = sigma_new if sigma is None else sigma        
         
         def produce_normalized_files_action(data, mu, sigma):
-            p_data = np.array([data[i] for i in indices], dtype=np.float64)
-            mu = np.array([0.0 if np.float64(sigma[i]) == 0.0 else mu[i] for i in range(len(sigma))], np.float64)             #Ignore single value lists
-            sigma = np.array([np.float64(1.0) if sigma[i] == np.float64(0.0) else sigma[i] for i in range(len(sigma))], np.float64)        #Ignore single value lists
+            p_data = np.array([data[i] for i in indices], dtype=self._np_dtype)
+            mu = np.array([0.0 if self._np_dtype.type(sigma[i]) == 0.0 else mu[i] for i in range(len(sigma))], self._np_dtype)             #Ignore single value lists
+            sigma = np.array([self._np_dtype.type(1.0) if sigma[i] == self._np_dtype.type(0.0) else sigma[i] for i in range(len(sigma))], self._np_dtype)        #Ignore single value lists
 
             #print("mu:" + str(mu))
             #print("sigma:" + str(sigma))
@@ -541,6 +549,7 @@ class MiniBatchSet(Iterator):
         bs._pool_async = content["pool_async"] 
         bs._bulk_size = content["bulk_size"] 
         bs._total_columns = content["total_columns"]
+        bs._np_dtype = np.dtype(content["np_dtype"])
         return bs
 
 
@@ -564,8 +573,9 @@ class MiniBatchSet(Iterator):
 
     def __eq__(self, other):
         other_files = other.get_files()
-        for file_key, file_shape in self._files.items():
-            if other_files.get(file_key, None) is None:
+        for file in self._files:
+            matches = [x for x in other_files if x['file_path'] == file['file_path']]
+            if len(matches) != 1:
                 return False
         return True
 
@@ -577,4 +587,3 @@ class MiniBatchSet(Iterator):
 
     def __next__(self):
         return self._retrieve_next()
-
