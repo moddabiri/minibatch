@@ -174,6 +174,7 @@ class MiniBatchSet(Iterator):
                     print("Load completion ETA: %d minute(s)"%eta)
                     print("Read %d lines of total %d"%(total_lines_read, self._total_lines))
 
+            self.reset()            
             print("Data fully loaded in the memory. Allocated size is %gKB."%(sys.getsizeof(self._data)/1000))
         except MemoryError as m_err:
             print("Failed to load the data on memory due to a memory error: " + str(m_err))
